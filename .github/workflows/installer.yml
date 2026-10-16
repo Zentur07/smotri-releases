@@ -1,0 +1,86 @@
+name: Build Windows installer
+run-name: Installer ${{ inputs.tag }}
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag (v0.4.0)
+        required: true
+        type: string
+      sha256:
+        description: SHA-256 of build-input.zip
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: installer-${{ inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      INPUT_SHA256: ${{ inputs.sha256 }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Validate draft and download compiled application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Invalid version tag' }
+          if ($env:INPUT_SHA256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid checksum' }
+          $draft = gh release view $env:RELEASE_TAG --json isDraft --jq .isDraft
+          if ($LASTEXITCODE -ne 0 -or $draft -ne 'true') { throw 'An existing draft release is required' }
+          gh release download $env:RELEASE_TAG --pattern build-input.zip --dir input
+          if ($LASTEXITCODE -ne 0) { throw 'Download failed' }
+          if ((Get-FileHash input/build-input.zip -Algorithm SHA256).Hash -ne $env:INPUT_SHA256) { throw 'Build input checksum mismatch' }
+          Expand-Archive input/build-input.zip input/app
+          $package = Get-Content input/app/package.json -Raw | ConvertFrom-Json
+          if ('v' + $package.version -ne $env:RELEASE_TAG) { throw 'Package version mismatch' }
+      - name: Install pinned packaging tools
+        run: npm ci --ignore-scripts
+      - name: Build NSIS installer and update metadata
+        run: node node_modules/electron-builder/cli.js --projectDir input/app --config electron-builder.yml --win nsis --x64 --publish never
+      - name: Smoke test the packaged application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:SMOTRI_SMOKE_REPORT = Join-Path $env:RUNNER_TEMP 'smotri-smoke.json'
+          $version = $env:RELEASE_TAG.Substring(1)
+          $setup = Join-Path $PWD "input/app/release/installer/Smotri-Setup-$version.exe"
+          $installed = Join-Path $env:RUNNER_TEMP 'Smotri-install-test'
+          $installation = Start-Process -FilePath $setup -ArgumentList '/S', "/D=$installed" -PassThru -WindowStyle Hidden
+          if (!$installation.WaitForExit(120000) -or $installation.ExitCode -ne 0) { throw 'Silent installation failed' }
+          if (!(Test-Path "$installed/resources/smotri-installed") -or !(Test-Path "$installed/resources/app-update.yml")) { throw 'Installer did not configure updates' }
+          $application = Join-Path $installed 'Smotri.exe'
+          $process = Start-Process -FilePath $application -ArgumentList '--smoke-test' -PassThru -WindowStyle Hidden
+          if (!$process.WaitForExit(45000)) { Stop-Process -Id $process.Id -Force; throw 'Application smoke test timed out' }
+          if (!(Test-Path $env:SMOTRI_SMOKE_REPORT)) { throw 'Application did not produce a smoke report' }
+          $report = Get-Content $env:SMOTRI_SMOKE_REPORT -Raw | ConvertFrom-Json
+          if (!$report.ok -or ('v' + $report.appVersion) -ne $env:RELEASE_TAG) { throw 'Packaged application failed smoke test' }
+          $report | ConvertTo-Json
+      - name: Validate and attach artifacts to draft
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_TAG.Substring(1)
+          $directory = 'input/app/release/installer'
+          $installer = "$directory/Smotri-Setup-$version.exe"
+          $manifest = "$directory/latest.yml"
+          if (!(Test-Path $installer) -or !(Test-Path "$installer.blockmap") -or !(Test-Path $manifest)) { throw 'Release artifacts are incomplete' }
+          $files = @($installer, "$installer.blockmap", $manifest)
+          $sums = foreach ($file in $files) { '{0}  {1}' -f (Get-FileHash $file -Algorithm SHA256).Hash.ToLower(), (Split-Path $file -Leaf) }
+          $sums | Set-Content "$directory/SHA256SUMS.txt" -Encoding ascii
+          gh release upload $env:RELEASE_TAG $installer "$installer.blockmap" $manifest "$directory/SHA256SUMS.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
+          # Compiled build input is temporary and must not appear in a public release.
+          gh release delete-asset $env:RELEASE_TAG build-input.zip --yes
+          if ($LASTEXITCODE -ne 0) { throw 'Could not remove temporary build input' }
+          Write-Output 'Installer attached to draft. Publication remains a separate verification step.'
