@@ -48,7 +48,7 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Build NSIS installer and update metadata
         run: node node_modules/electron-builder/cli.js --projectDir input/app --config electron-builder.yml --win nsis --x64 --publish never
-      - name: Smoke test the packaged application
+      - name: Verify installation, upgrade from previous release and room isolation
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -56,15 +56,37 @@ jobs:
           $version = $env:RELEASE_TAG.Substring(1)
           $setup = Join-Path $PWD "input/app/release/installer/Smotri-Setup-$version.exe"
           $installed = Join-Path $env:RUNNER_TEMP 'Smotri-install-test'
+          # Exercise NSIS's real upgrade path before testing the new app. The
+          # previous public installer is downloaded into this disposable runner.
+          $previousTag = gh release view --json tagName --jq .tagName
+          if ($LASTEXITCODE -ne 0) { throw 'Could not determine previous public release' }
+          if ($previousTag -ne $env:RELEASE_TAG) {
+            $previousVersion = $previousTag.TrimStart('v')
+            if ($previousVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Invalid previous version' }
+            $previousDirectory = Join-Path $env:RUNNER_TEMP 'Smotri-previous-release'
+            gh release download $previousTag --pattern "Smotri-Setup-$previousVersion.exe" --pattern SHA256SUMS.txt --dir $previousDirectory
+            if ($LASTEXITCODE -ne 0) { throw 'Previous installer download failed' }
+            $previousSetup = Join-Path $previousDirectory "Smotri-Setup-$previousVersion.exe"
+            $checksumLine = Get-Content (Join-Path $previousDirectory 'SHA256SUMS.txt') | Where-Object { $_ -match ('  ' + [regex]::Escape("Smotri-Setup-$previousVersion.exe") + '$') }
+            if (!$checksumLine -or (Get-FileHash $previousSetup -Algorithm SHA256).Hash -ne ($checksumLine -split '  ')[0]) { throw 'Previous installer checksum mismatch' }
+            $previousInstallation = Start-Process -FilePath $previousSetup -ArgumentList '/S', "/D=$installed" -PassThru -WindowStyle Hidden
+            if (!$previousInstallation.WaitForExit(120000) -or $previousInstallation.ExitCode -ne 0) { throw 'Previous installation failed' }
+          }
+          $profileDirectory = Join-Path $env:APPDATA 'smotri'
+          New-Item -ItemType Directory -Force $profileDirectory | Out-Null
+          $profileMarker = Join-Path $profileDirectory 'upgrade-test.txt'
+          $markerValue = [guid]::NewGuid().ToString()
+          Set-Content -LiteralPath $profileMarker -Value $markerValue
           $installation = Start-Process -FilePath $setup -ArgumentList '/S', "/D=$installed" -PassThru -WindowStyle Hidden
           if (!$installation.WaitForExit(120000) -or $installation.ExitCode -ne 0) { throw 'Silent installation failed' }
+          if (!(Test-Path -LiteralPath $profileMarker) -or (Get-Content -LiteralPath $profileMarker -Raw).Trim() -ne $markerValue) { throw 'Upgrade did not preserve the profile directory' }
           if (!(Test-Path "$installed/resources/smotri-installed") -or !(Test-Path "$installed/resources/app-update.yml")) { throw 'Installer did not configure updates' }
           $application = Join-Path $installed 'Smotri.exe'
           $process = Start-Process -FilePath $application -ArgumentList '--smoke-test' -PassThru -WindowStyle Hidden
           if (!$process.WaitForExit(45000)) { Stop-Process -Id $process.Id -Force; throw 'Application smoke test timed out' }
           if (!(Test-Path $env:SMOTRI_SMOKE_REPORT)) { throw 'Application did not produce a smoke report' }
           $report = Get-Content $env:SMOTRI_SMOKE_REPORT -Raw | ConvertFrom-Json
-          if (!$report.ok -or ('v' + $report.appVersion) -ne $env:RELEASE_TAG) { throw 'Packaged application failed smoke test' }
+          if (!$report.ok -or !$report.roomIsolated -or !$report.roomProfile -or !$report.profileCleared -or ('v' + $report.appVersion) -ne $env:RELEASE_TAG) { throw 'Packaged application failed smoke test' }
           $report | ConvertTo-Json
       - name: Validate and attach artifacts to draft
         shell: pwsh
